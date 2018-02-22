@@ -1,0 +1,118 @@
+---
+# Copyright 2018, Rackspace US, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+- name: Setup nspawn host
+  hosts: localhost
+  connection: local
+  become: true
+  pre_tasks:
+    - name: Gather facts
+      setup:
+        gather_subset: "!all"
+
+    - name: Show host facts
+      debug:
+        var: hostvars
+
+    - name: Create test network service
+      template:
+        src: "templates/test-networks.service.j2"
+        dest: "/etc/systemd/system/00-test-networks.service"
+
+    - name: Enable test network service
+      systemd:
+        name: "00-test-networks.service"
+        state: "started"
+        enabled: true
+        daemon_reload: true
+
+    - name: Ensure root ssh key
+      user:
+        name: "{{ ansible_user_id | default('root') }}"
+        generate_ssh_key: "yes"
+        ssh_key_bits: 2048
+        ssh_key_file: ".ssh/id_rsa"
+
+    - name: Get root ssh key
+      slurp:
+        src: '~/.ssh/id_rsa.pub'
+      register: _root_ssh_key
+
+    - name: Prepare container ssh key fact
+      set_fact:
+        nspawn_container_ssh_key: "{{ _root_ssh_key['content'] | b64decode }}"
+
+    - name: Ensure public ssh key is in authorized_keys
+      authorized_key:
+        user: "{{ ansible_env.USER | default('root') }}"
+        key: "{{ nspawn_container_ssh_key }}"
+        manage_dir: no
+
+    - name: Clear iptables rules
+      command: "{{ item }}"
+      with_items:
+        - "iptables -F"
+        - "iptables -X"
+        - "iptables -t nat -F"
+        - "iptables -t nat -X"
+        - "iptables -t mangle -F"
+        - "iptables -t mangle -X"
+        - "iptables -P INPUT ACCEPT"
+        - "iptables -P FORWARD ACCEPT"
+        - "iptables -P OUTPUT ACCEPT"
+        - "iptables -A POSTROUTING -t mangle -p tcp -j CHECKSUM --checksum-fill"
+        - "iptables -t nat -A POSTROUTING -o {{ ansible_default_ipv4.interface }} -j MASQUERADE"
+      tags:
+        - skip_ansible_lint
+
+    # This is a temporary hack to override the nspawn image source to
+    # the reverse proxy if the test is run in OpenStack-Infra.
+    - name: Check if this is an OpenStack-CI nodepool instance
+      stat:
+        path: /etc/nodepool/provider
+      register: nodepool
+
+    - name: Discover the nspawn_image_cache_server value when in nodepool
+      shell: |
+        source /etc/ci/mirror_info.sh
+        echo "${NODEPOOL_MIRROR_HOST}:8080/images.linuxcontainers"
+      args:
+        executable: /bin/bash
+      register: nspawn_reverse_proxy
+      when:
+        - nodepool.stat.exists | bool
+      tags:
+        - skip_ansible_lint
+
+    - name: Set a fact to override nspawn_image_cache_server value when in nodepool
+      set_fact:
+        nspawn_image_cache_server_mirrors: ["http://{{ nspawn_reverse_proxy.stdout.strip('/') }}"]
+      when:
+        - nodepool.stat.exists | bool
+
+  roles:
+    - role: "nspawn_hosts"
+
+  post_tasks:
+    - name: Create detail gathering script
+      template:
+        src: "dump-container-details.sh.j2"
+        dest: "/opt/dump-{{ inventory_hostname }}-details.sh"
+        mode: "0755"
+
+    - name: Collect details
+      command: "/opt/dump-{{ inventory_hostname }}-details.sh"
+      tags:
+        - skip_ansible_lint
